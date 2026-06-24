@@ -11,6 +11,7 @@ import threading
 import time
 from collections import defaultdict
 from contextlib import nullcontext
+from dataclasses import dataclass
 from itertools import count
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Type, Union
 
@@ -169,6 +170,19 @@ NOT_QUANTIZE_FLAG = ":!"
 CAPTURE_ONLY_FLAG = ":?"
 MOE_FLAG = ":moe"
 NON_QUANTIZE_FLAGS = (NOT_QUANTIZE_FLAG, CAPTURE_ONLY_FLAG)
+
+
+@dataclass(frozen=True)
+class QuantizationRegion:
+    """Describe one independently captured stack of quantizable modules."""
+
+    name: str
+    layers_node: Union[str, List[str]]
+    module_tree: Optional[List[Any]] = None
+    layer_modules: Optional[List[List[str]]] = None
+    planning_layer_modules: Optional[List[List[str]]] = None
+    offload_base_modules: Optional[List[str]] = None
+    include_lm_head: bool = False
 
 
 # Fix cpu memory leak.
@@ -742,6 +756,203 @@ class BaseQModel(nn.Module):
         full = cls.build_moe_modules_if_need(model_config, full, is_awq_quantize)
         # print(f"full layer_modules: {full}")
         return full
+
+    def quantization_regions(self, processors=None) -> List[QuantizationRegion]:
+        """Return the ordered regions to capture and quantize.
+
+        Most decoder-only models have a single region matching the historical
+        layer container. Multimodal models with independently staged stacks can
+        override this to recapture activations between regions.
+        """
+
+        del processors
+        return [
+            QuantizationRegion(
+                name="default",
+                layers_node=self.extract_layers_node(),
+                module_tree=self.module_tree,
+                include_lm_head=bool(getattr(self.quantize_config, "lm_head", False)),
+            )
+        ]
+
+    @classmethod
+    def simple_layer_modules_for_region(
+        cls,
+        region: QuantizationRegion,
+        model_config,
+        quantize_config,
+        is_awq_quantize: bool = False,
+        include_capture_only: bool = False,
+    ):
+        if region.layer_modules is not None:
+            layer_modules = [list(block) for block in region.layer_modules]
+        else:
+            tree = region.module_tree if region.module_tree is not None else cls.module_tree
+            layer_modules = cls.build_layer_modules(tree, include_capture_only=include_capture_only)
+
+        layer_modules = cls.build_moe_modules_if_need(model_config, layer_modules, is_awq_quantize)
+        layer_modules = cls.filter_not_quantize_module(layer_modules, quantize_config)
+        return layer_modules
+
+    @classmethod
+    def full_layer_modules_for_region(
+        cls,
+        region: QuantizationRegion,
+        model_config=None,
+        is_awq_quantize: bool = False,
+        include_capture_only: bool = False,
+    ):
+        if region.planning_layer_modules is not None:
+            full = [list(block) for block in region.planning_layer_modules]
+        elif region.layer_modules is not None:
+            full = [list(block) for block in region.layer_modules]
+        else:
+            tree = region.module_tree if region.module_tree is not None else cls.module_tree
+            full = cls.build_layer_modules(tree, include_capture_only=include_capture_only)
+
+        full = cls.build_moe_modules_if_need(model_config, full, is_awq_quantize)
+        return full
+
+    def enter_quantization_region(self, region: QuantizationRegion) -> None:
+        """Hook called before calibration capture for one region."""
+
+        self._active_quantization_region = region
+
+    def exit_quantization_region(self, region: QuantizationRegion) -> None:
+        """Hook called after region staging completes."""
+
+        if getattr(self, "_active_quantization_region", None) is region:
+            self._active_quantization_region = None
+
+    @staticmethod
+    def _paths_overlap(left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+        return left == right or left.startswith(f"{right}.") or right.startswith(f"{left}.")
+
+    @classmethod
+    def _region_layer_nodes(cls, region: QuantizationRegion) -> List[str]:
+        layers_node = getattr(region, "layers_node", None)
+        if layers_node is None:
+            return []
+        if isinstance(layers_node, str):
+            return [layers_node]
+        return [node for node in layers_node if isinstance(node, str)]
+
+    @classmethod
+    def _get_base_modules_for_module_tree(cls, model: nn.Module, module_tree=None) -> List[str]:
+        """Return base modules implied by a specific module tree."""
+
+        all_prefix_paths = []
+        for tree in cls._iter_module_tree_variants(module_tree):
+            try:
+                sharp_idx = tree.index("#")
+            except ValueError:
+                raise ValueError("module_tree must contain '#' to separate hierarchy")
+
+            assert sharp_idx > 0, "failed to get_base_modules"
+            for path in cls._expand_module_tree_prefixes(tree):
+                prefix = tuple(path.split("."))
+                if prefix not in all_prefix_paths:
+                    all_prefix_paths.append(prefix)
+
+        if not all_prefix_paths:
+            return []
+
+        exclude_by_parent: Dict[tuple[str, ...], set[str]] = {}
+        for parts in all_prefix_paths:
+            for i in range(len(parts) - 1):
+                parent_path = parts[: i + 1]
+                # Each tree reserves the next path segment for layer traversal.
+                exclude_by_parent.setdefault(parent_path, set()).add(parts[i + 1])
+
+        out = []
+        seen = set()
+        for parts in all_prefix_paths:
+            for i in range(len(parts) - 1):
+                path = parts[: i + 1]
+                base = model
+                exclude = exclude_by_parent.get(path, set())
+
+                for node in path:
+                    base = getattr(base, node, None)
+                    if base is None:
+                        break
+                if base is None:
+                    continue
+
+                for name, _ in base.named_children():
+                    if name in exclude:
+                        continue
+                    full_name = ".".join((*path, name))
+                    if full_name in seen:
+                        continue
+                    seen.add(full_name)
+                    out.append(full_name)
+        return out
+
+    def quantization_region_base_modules(self, region: QuantizationRegion) -> List[str]:
+        """Return base modules that may be offloaded before quantizing one region."""
+
+        offload_base_modules = getattr(region, "offload_base_modules", None)
+        if offload_base_modules is not None:
+            return list(offload_base_modules)
+
+        active_nodes = self._region_layer_nodes(region)
+        region_module_tree = getattr(region, "module_tree", None)
+        if region_module_tree is not None:
+            base_modules = self._get_base_modules_for_module_tree(self.model, region_module_tree)
+        else:
+            base_modules = self.get_base_modules(model=self.model)
+
+        return [
+            module_name
+            for module_name in base_modules
+            if not any(self._paths_overlap(module_name, active_node) for active_node in active_nodes)
+        ]
+
+    def input_capture_base_modules(self, region: Optional[QuantizationRegion] = None) -> List[str]:
+        """Return outside-layer modules that input capture must materialize."""
+
+        del region
+        return self.get_base_modules(self.model)
+
+    def should_skip_layer_stage(
+        self,
+        *,
+        module: nn.Module,
+        layer_name: str,
+        region: Optional[QuantizationRegion],
+    ) -> bool:
+        """Return True only when the entire layer stage should be skipped.
+
+        Skipping here bypasses quantization, replay, output propagation, and
+        finalization for the layer. Model definitions should use it only for
+        layers that must behave as absent from the current region.
+        """
+
+        legacy_hook = type(self).__dict__.get("should_skip_quantization_layer")
+        if legacy_hook is not None and legacy_hook is not BaseQModel.should_skip_quantization_layer:
+            return legacy_hook(self, module=module, layer_name=layer_name, region=region)
+
+        del module, layer_name, region
+        return False
+
+    def should_skip_quantization_layer(
+        self,
+        *,
+        module: nn.Module,
+        layer_name: str,
+        region: Optional[QuantizationRegion],
+    ) -> bool:
+        """Backward-compatible alias for should_skip_layer_stage."""
+
+        stage_hook = type(self).__dict__.get("should_skip_layer_stage")
+        if stage_hook is not None and stage_hook is not BaseQModel.should_skip_layer_stage:
+            return stage_hook(self, module=module, layer_name=layer_name, region=region)
+
+        del module, layer_name, region
+        return False
 
     def prepare_dataset(
         self,
@@ -2965,54 +3176,7 @@ class BaseQModel(nn.Module):
         """
         Return list of base modules directly under the root path but not the layer container.
         """
-        all_prefix_paths = []
-        for tree in cls._iter_module_tree_variants():
-            try:
-                sharp_idx = tree.index("#")
-            except ValueError:
-                raise ValueError("module_tree must contain '#' to separate hierarchy")
-
-            assert sharp_idx > 0, "failed to get_base_modules"
-            for path in cls._expand_module_tree_prefixes(tree):
-                prefix = tuple(path.split("."))
-                if prefix not in all_prefix_paths:
-                    all_prefix_paths.append(prefix)
-
-        if not all_prefix_paths:
-            return []
-
-        exclude_by_parent: Dict[tuple[str, ...], set[str]] = {}
-        for parts in all_prefix_paths:
-            for i in range(len(parts) - 1):
-                parent_path = parts[: i + 1]
-                # Each tree reserves the next path segment for layer traversal.
-                exclude_by_parent.setdefault(parent_path, set()).add(parts[i + 1])
-
-        out = []
-        seen = set()
-        for parts in all_prefix_paths:
-            for i in range(len(parts) - 1):
-                path = parts[: i + 1]
-                base = model
-                exclude = exclude_by_parent.get(path, set())
-
-                for node in path:
-                    base = getattr(base, node, None)
-                    if base is None:
-                        break
-                if base is None:
-                    continue
-
-                for name, _ in base.named_children():
-                    # print("name", base, name, exclude)
-                    if name in exclude:
-                        continue
-                    full_name = ".".join((*path, name))
-                    if full_name in seen:
-                        continue
-                    seen.add(full_name)
-                    out.append(full_name)
-        return out
+        return cls._get_base_modules_for_module_tree(model, cls.module_tree)
 
     def generate_layers_modules_tree_simple(self, node):
         """

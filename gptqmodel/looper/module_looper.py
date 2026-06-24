@@ -34,7 +34,7 @@ from ..looper.loop_processor import LoopProcessor
 from ..looper.named_module import NamedModule
 from ..models import BaseQModel
 from ..models._const import SUPPORTS_MODULE_TYPES
-from ..models.base import CAPTURE_ONLY_FLAG
+from ..models.base import CAPTURE_ONLY_FLAG, QuantizationRegion
 from ..nn_modules.hooked_linear import HookedLinear, replace_module_with_hooked_legacy
 from ..quantization.config import METHOD, VramStrategy
 from ..utils.attn_mask import apply_keep_mask_bt
@@ -1399,6 +1399,126 @@ class ModuleLooper():
             use_cache=use_cache,
         )
 
+    def _release_calibration_datasets(self) -> None:
+        """Release prepared calibration rows once no later region capture needs them."""
+
+        for processor in self.processors:
+            if hasattr(processor, "calibration_dataset"):
+                processor.release_calibration_dataset()
+
+    def _cache_region_inputs(self, layers, region: QuantizationRegion) -> None:
+        """Capture calibration inputs for every processor for one quantization region."""
+
+        for p_index, processor in enumerate(self.processors):
+            if not processor.verify_calibration_dataset(p_index):
+                if isinstance(processor, EoraProcessor) or\
+                        (isinstance(processor, GPTQProcessor) and getattr(self.gptq_model.quantize_config, "gptaq", None) is not None) or\
+                        (isinstance(processor, GPTQProcessor) and getattr(self.gptq_model.quantize_config, "foem", None) is not None):
+                    prev_processor = self.processors[p_index - 1]
+                    processor.set_calibration_dataset(prev_processor.calibration_dataset)
+                    # If calibration_dataset is None or Empty, the input_cache of the previous processor is used.
+                    processor.receive_input_cache(prev_processor.inputs_cache)
+                elif isinstance(processor, DequantizeProcessor):
+                    # DequantizeProcessor does not perform any operations on dataset.
+                    processor.set_calibration_dataset([])
+                    processor.receive_input_cache(InputCache([], [], [], []))
+
+                continue
+
+            input_cache = self.cache_inputs(
+                layers=layers,
+                calibration_data=processor.calibration_dataset,
+                use_cache=False,
+            )
+            processor.receive_input_cache(input_cache)
+
+    def _run_quantization_region(
+        self,
+        *,
+        region: QuantizationRegion,
+        fallback,
+        is_awq_quantize: bool,
+        requires_activation_capture: bool,
+        region_timer,
+        release_calibration_after_capture: bool = False,
+    ) -> None:
+        """Capture and quantize one model-defined region."""
+
+        layers, layer_names = get_layers_with_prefixes(
+            self.gptq_model.model,
+            region.layers_node,
+        )
+        if not layers:
+            log.info("ModuleLooper: skipping quantization region `%s`; no layers found.", region.name)
+            return
+
+        self.gptq_model.enter_quantization_region(region)
+        try:
+            self._cache_region_inputs(layers=layers, region=region)
+
+            if release_calibration_after_capture:
+                self._release_calibration_datasets()
+
+            if self.gptq_model.quantize_config.offload_to_disk:
+                base_modules = self.gptq_model.quantization_region_base_modules(region)
+                log.info("Offloading base modules to disk...")
+                if base_modules:
+                    offload_to_disk(
+                        model=self.gptq_model.model,
+                        module=base_modules,
+                        disk_path=self.gptq_model.quantize_config.offload_to_disk_path
+                    )
+
+            layer_modules = self.gptq_model.simple_layer_modules_for_region(
+                region,
+                model_config=self.gptq_model.model.config,
+                quantize_config=self.gptq_model.quantize_config,
+                is_awq_quantize=is_awq_quantize,
+                include_capture_only=requires_activation_capture,
+            )
+            planning_layer_modules = self.gptq_model.full_layer_modules_for_region(
+                region,
+                model_config=self.gptq_model.model.config,
+                is_awq_quantize=is_awq_quantize,
+                include_capture_only=requires_activation_capture,
+            )
+
+            # true-sequential will replay the quantized activations after each
+            # subset has been quantized to be used for next subset quantization.
+            if not self.gptq_model.quantize_config.true_sequential:
+                layer_modules = [sum(layer_modules, [])]
+
+            layer_count = len(layers)
+            include_lm_head = bool(
+                region.include_lm_head
+                and self.gptq_model.quantize_config.lm_head
+            )
+            pb = (log.pb(layer_count + 1 if include_lm_head else layer_count)
+                                .manual()
+                                .set(left_steps_offset=1))
+
+            for processor in self.processors:
+                processor.layer_count = layer_count
+                processor.pb = pb
+
+            shared_kv_cache_dict = {}
+            run_layer_stage(
+                self,
+                layers=layers,
+                layer_modules=layer_modules,
+                planning_layer_modules=planning_layer_modules,
+                layer_names=layer_names,
+                fallback=fallback,
+                shared_kv_cache_dict=shared_kv_cache_dict,
+                pb=pb,
+                layer_count=layer_count,
+                region_timer=region_timer,
+                finalize_progress_cls=FinalizeProgressInfo,
+                logger=log,
+            )
+        finally:
+            self.gptq_model.exit_quantization_region(region)
+
     def loop(self, fallback=None, **kwargs):
         """Run the quantization loop under the TF32 guard."""
 
@@ -1435,44 +1555,7 @@ class ModuleLooper():
 
         forward_pass_use_cache = self.gptq_model.model.config.use_cache if hasattr(self.gptq_model.model.config, "use_cache") else False
         self.gptq_model.model.config.use_cache = False
-        layers, layer_names = get_layers_with_prefixes(
-            self.gptq_model.model,
-            self.gptq_model.extract_layers_node(),
-        )
         region_timer = getattr(self.gptq_model, "quant_region_timer", None)
-
-        for p_index, processor in enumerate(self.processors):
-            if not processor.verify_calibration_dataset(p_index):
-                if isinstance(processor, EoraProcessor) or\
-                        (isinstance(processor, GPTQProcessor) and getattr(self.gptq_model.quantize_config, "gptaq", None) is not None) or\
-                        (isinstance(processor, GPTQProcessor) and getattr(self.gptq_model.quantize_config, "foem", None) is not None):
-                    prev_processor = self.processors[p_index - 1]
-                    processor.set_calibration_dataset(prev_processor.calibration_dataset)
-                    # If calibration_dataset is None or Empty, the input_cache of the previous processor is used.
-                    processor.receive_input_cache(prev_processor.inputs_cache)
-                elif isinstance(processor, DequantizeProcessor):
-                    # DequantizeProcessor does not perform any operations on dataset.
-                    processor.set_calibration_dataset([])
-                    processor.receive_input_cache(InputCache([], [], [], []))
-
-                continue
-
-            input_cache = self.cache_inputs(layers=layers,
-                                            calibration_data=processor.calibration_dataset,
-                                            use_cache=False)
-            processor.receive_input_cache(input_cache)
-
-        # release calibration_dataset
-        for processor in self.processors:
-            processor.release_calibration_dataset()
-
-        if self.gptq_model.quantize_config.offload_to_disk:
-            log.info("Offloading base modules to disk...")
-            offload_to_disk(
-                model=self.gptq_model.model,
-                module=self.gptq_model.get_base_modules(model=self.gptq_model.model),
-                disk_path=self.gptq_model.quantize_config.offload_to_disk_path
-            )
 
         for processor in self.processors:
             # Pre-build ParoQuant's optional fused rotation extension before the
@@ -1490,33 +1573,6 @@ class ModuleLooper():
             getattr(getattr(proc, "execution_config", None), "enable_activation_capture", False)
             for proc in self.processors
         )
-        layer_modules = self.gptq_model.simple_layer_modules(
-            model_config=self.gptq_model.model.config,
-            quantize_config=self.gptq_model.quantize_config,
-            is_awq_quantize=is_awq_quantize,
-            include_capture_only=requires_activation_capture,
-        )
-        planning_layer_modules = self.gptq_model.full_layer_modules(
-            model_config=self.gptq_model.model.config,
-            is_awq_quantize=is_awq_quantize,
-            include_capture_only=requires_activation_capture,
-        )
-
-        # true-sequential will replay the quantized activations after each subset has been quantized to be used for next subset quantization
-        # this should always be true for gptq unless you want lower but misleading error_loss that is misleading and will lead to lower post-quantized model
-        if not self.gptq_model.quantize_config.true_sequential:
-            layer_modules = [sum(layer_modules, [])]
-
-        layer_count = len(layers)
-        pb = (log.pb(layer_count + 1 if self.gptq_model.quantize_config.lm_head else layer_count)
-                            .manual()
-                            .set(left_steps_offset=1))
-
-        for processor in self.processors:
-            processor.layer_count = layer_count
-            processor.pb = pb
-
-        shared_kv_cache_dict = {}
 
         if self.gptq_model.quantize_config.lm_head:
             lm_head_module = get_module(self.gptq_model.model, key=self.gptq_model.lm_head)
@@ -1528,20 +1584,20 @@ class ModuleLooper():
                     parent = getattr(parent, part)
                 setattr(parent, module_path[-1], hooked_lm_head)
 
-        run_layer_stage(
-            self,
-            layers=layers,
-            layer_modules=layer_modules,
-            planning_layer_modules=planning_layer_modules,
-            layer_names=layer_names,
-            fallback=fallback,
-            shared_kv_cache_dict=shared_kv_cache_dict,
-            pb=pb,
-            layer_count=layer_count,
-            region_timer=region_timer,
-            finalize_progress_cls=FinalizeProgressInfo,
-            logger=log,
-        )
+        regions = self.gptq_model.quantization_regions(processors=self.processors)
+        for region_index, region in enumerate(regions):
+            self._run_quantization_region(
+                region=region,
+                fallback=fallback,
+                is_awq_quantize=is_awq_quantize,
+                requires_activation_capture=requires_activation_capture,
+                region_timer=region_timer,
+                release_calibration_after_capture=region_index == len(regions) - 1,
+            )
+
+        # Safety release for models with no resolved regions or processors that
+        # did not require capture in the final region.
+        self._release_calibration_datasets()
 
         # LifeCycle: All sub-modules have finalized meaning quantization work is complete
         self._check_loop_stop()
@@ -1641,7 +1697,12 @@ class ModuleLooper():
                 capture_only_flags[n] = True  # forward-only modules should not be finalized
         skipped_modules = []
         for name in subset:
-            layer_name = self.gptq_model.lm_head if is_lm_head_module else f"{layers_prefix}.{name}"
+            if is_lm_head_module:
+                layer_name = self.gptq_model.lm_head
+            elif name:
+                layer_name = f"{layers_prefix}.{name}"
+            else:
+                layer_name = layers_prefix
 
             # gptq task is created and stored inside processor
             if not isinstance(subset[name], NamedModule):

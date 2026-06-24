@@ -23,7 +23,7 @@ from gptqmodel.looper.stage_layer import (
     run_layer_stage,
 )
 from gptqmodel.looper.stage_subset import CalibrationCoveragePolicy, SubsetPlan, SubsetStageResult
-from gptqmodel.models.base import BaseQModel
+from gptqmodel.models.base import BaseQModel, QuantizationRegion
 from gptqmodel.quantization.config import QuantizeConfig
 
 
@@ -73,6 +73,77 @@ def test_cache_inputs_delegates_to_stage_capture(monkeypatch):
     assert captured["looper"] is looper
     assert captured["kwargs"]["layers"] == layers
     assert captured["kwargs"]["calibration_data"] is data
+
+
+def test_region_releases_calibration_after_final_capture_before_quantization(monkeypatch):
+    module_looper_module = sys.modules[ModuleLooper.__module__]
+    processor_events = []
+
+    class FakeProcessor:
+        def __init__(self):
+            self.calibration_dataset = [{"hidden_states": torch.zeros(1, 2, 2)}]
+            self.layer_count = 0
+            self.pb = None
+
+        def verify_calibration_dataset(self, _processor_index):
+            return True
+
+        def receive_input_cache(self, input_cache):
+            self.inputs_cache = input_cache
+
+        def release_calibration_dataset(self):
+            processor_events.append("release")
+            del self.calibration_dataset
+
+    class FakeQModel:
+        def __init__(self):
+            self.model = types.SimpleNamespace(config=types.SimpleNamespace())
+            self.quantize_config = types.SimpleNamespace(
+                offload_to_disk=False,
+                true_sequential=True,
+            )
+
+        def enter_quantization_region(self, region):
+            self._active_quantization_region = region
+
+        def exit_quantization_region(self, region):
+            del region
+            self._active_quantization_region = None
+
+        def simple_layer_modules_for_region(self, *args, **kwargs):
+            return []
+
+        def full_layer_modules_for_region(self, *args, **kwargs):
+            return []
+
+    processor = FakeProcessor()
+    looper = ModuleLooper.__new__(ModuleLooper)
+    looper.gptq_model = FakeQModel()
+    looper.processors = [processor]
+    looper.cache_inputs = lambda **_kwargs: object()
+
+    def fake_run_layer_stage(*args, **kwargs):
+        del args, kwargs
+        processor_events.append("stage")
+        assert not hasattr(processor, "calibration_dataset")
+
+    monkeypatch.setattr(
+        module_looper_module,
+        "get_layers_with_prefixes",
+        lambda _model, _node: ([torch.nn.Identity()], ["model.layers.0"]),
+    )
+    monkeypatch.setattr(module_looper_module, "run_layer_stage", fake_run_layer_stage)
+
+    looper._run_quantization_region(
+        region=QuantizationRegion(name="default", layers_node="model.layers"),
+        fallback=None,
+        is_awq_quantize=False,
+        requires_activation_capture=False,
+        region_timer=None,
+        release_calibration_after_capture=True,
+    )
+
+    assert processor_events == ["release", "stage"]
 
 
 def test_assign_quant_device_prefers_balanced_hint():

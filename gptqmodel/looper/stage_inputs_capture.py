@@ -37,7 +37,11 @@ class StageInputsCapture:
         self.logger = logger or setup_logger()
 
     def _materialize_modules_with_direct_meta_tensors(self, device: torch.device) -> None:
-        for module_name in self.gptq_model.get_modules_with_direct_meta_tensors(self.gptq_model.model):
+        direct_meta_modules = getattr(self.gptq_model, "get_modules_with_direct_meta_tensors", None)
+        if not callable(direct_meta_modules):
+            return
+
+        for module_name in direct_meta_modules(self.gptq_model.model):
             module = get_module(self.gptq_model.model, module_name)
             if isinstance(module, torch.nn.Module):
                 self.gptq_model.shell_direct_meta_materialize(
@@ -187,7 +191,14 @@ class StageInputsCapture:
         self._materialize_modules_with_direct_meta_tensors(cur_layer_device)
 
         ori_outside_layer_module_devices: Dict[str, torch.device] = {}
-        for module_name in self.gptq_model.get_base_modules(self.gptq_model.model):
+        active_region = getattr(self.gptq_model, "_active_quantization_region", None)
+        capture_base_modules = getattr(self.gptq_model, "input_capture_base_modules", None)
+        if callable(capture_base_modules):
+            base_module_names = capture_base_modules(active_region)
+        else:
+            base_module_names = self.gptq_model.get_base_modules(self.gptq_model.model)
+
+        for module_name in base_module_names:
             module, _ = get_module_by_name_prefix(self.gptq_model.model, [module_name])
 
             if module is None:

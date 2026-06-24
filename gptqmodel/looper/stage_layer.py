@@ -69,7 +69,7 @@ def _find_last_quantized_layer_index(
     for candidate_layer_index in range(layer_count):
         layer_name = get_layer_name(layer_names, candidate_layer_index)
         for module_name in layer_module_names:
-            module_full_name = f"{layer_name}.{module_name}"
+            module_full_name = f"{layer_name}.{module_name}" if module_name else layer_name
             # If at least one module in this layer is not dynamically excluded,
             # the layer still needs forward/quantization work.
             if looper.gptq_model.quantize_config.dynamic_get(layer_name=module_full_name) != False:
@@ -388,7 +388,8 @@ def run_layer_stage(
     layers: List[torch.nn.Module],
     layer_modules: List[List[str]],
     planning_layer_modules: List[List[str]],
-    layer_names: Optional[List[str]],
+    layer_names: Optional[List[str]] = None,
+    layers_prefix: Optional[str] = None,
     fallback,
     shared_kv_cache_dict: Dict[int, torch.Tensor],
     pb,
@@ -398,6 +399,9 @@ def run_layer_stage(
     logger=None,
 ) -> None:
     """Execute the main per-layer quantization loop."""
+    if layer_names is None and layers_prefix:
+        layer_names = [f"{layers_prefix}.{layer_index}" for layer_index in range(layer_count)]
+
     # Trailing layers whose tracked modules are all dynamically excluded never
     # need another forward or finalize pass, so the loop can stop once the
     # final eligible layer has been processed.
@@ -453,8 +457,14 @@ def run_layer_stage(
                 layer_title,
             )
 
-        if module.__class__.__name__.lower() == "MllamaCrossAttentionDecoderLayer".lower():
-            # TODO FIXME: currently we not support quantizing cross attention layer (pixel_values)
+        should_skip_layer = getattr(looper.gptq_model, "should_skip_layer_stage", None)
+        if not callable(should_skip_layer):
+            should_skip_layer = getattr(looper.gptq_model, "should_skip_quantization_layer", None)
+        if callable(should_skip_layer) and should_skip_layer(
+            module=module,
+            layer_name=layer_name,
+            region=getattr(looper.gptq_model, "_active_quantization_region", None),
+        ):
             continue
 
         module = looper.gptq_model.pre_quantize(module)
